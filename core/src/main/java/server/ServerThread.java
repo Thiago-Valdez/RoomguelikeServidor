@@ -8,11 +8,25 @@ import java.util.ArrayList;
 
 public class ServerThread extends Thread {
 
+    // ===== Constantes =====
+    private static final int SERVER_PORT = 5555;
+    private static final int BUFFER_SIZE = 1024;
+    private static final int MAX_CLIENTS = 2;
+    private static final String SEP = ":";
+
+    // Comandos
+    private static final String CMD_CONNECT = "Connect";
+    private static final String CMD_MOVE = "Move";
+    private static final String CMD_SPAWN = "Spawn";
+    private static final String CMD_DOOR = "Door";
+
+    private static final String MSG_ALREADY_CONNECTED = "AlreadyConnected";
+    private static final String MSG_FULL = "Full";
+    private static final String MSG_NOT_CONNECTED = "NotConnected";
+
     private DatagramSocket socket;
-    private final int serverPort = 5555;
     private volatile boolean end = false;
 
-    private static final int MAX_CLIENTS = 2;
     private int connectedClients = 0;
     private final ArrayList<Client> clients = new ArrayList<>();
 
@@ -22,56 +36,77 @@ public class ServerThread extends Thread {
     private int nivelPartida = 1;
     private boolean partidaArrancada = false;
 
+    // Reutilizable para no allocar cada loop
+    private final byte[] buffer = new byte[BUFFER_SIZE];
+
     public ServerThread(GameController gameController) {
+        super("ServerThread");
         this.gameController = gameController;
+
         try {
-            socket = new DatagramSocket(serverPort);
-            System.out.println("[SERVER] Escuchando en puerto " + serverPort);
+            socket = new DatagramSocket(SERVER_PORT);
+            System.out.println("[SERVER] Escuchando en puerto " + SERVER_PORT);
         } catch (SocketException e) {
-            System.out.println("[SERVER] No se pudo abrir el puerto " + serverPort + ": " + e.getMessage());
+            System.out.println("[SERVER] No se pudo abrir el puerto " + SERVER_PORT + ": " + e.getMessage());
         }
     }
 
     @Override
     public void run() {
+        if (socket == null) return;
+
+        DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+
         while (!end) {
-            DatagramPacket packet = new DatagramPacket(new byte[1024], 1024);
             try {
                 socket.receive(packet);
                 processMessage(packet);
+            } catch (SocketException se) {
+                // normal cuando cerrás el socket en terminate()
+                if (!end) System.out.println("[SERVER] Socket: " + se.getMessage());
             } catch (IOException e) {
                 if (!end) System.out.println("[SERVER] IO: " + e.getMessage());
+            } catch (Exception e) {
+                // ✅ evita que el server thread muera por mensajes raros
+                if (!end) System.out.println("[SERVER] Unexpected: " + e.getMessage());
             }
         }
     }
 
     private void processMessage(DatagramPacket packet) {
-        String message = new String(packet.getData(), 0, packet.getLength()).trim();
-        String[] parts = message.split(":");
+        final String message = new String(packet.getData(), 0, packet.getLength()).trim();
+        if (message.isEmpty()) return;
 
-        int index = findClientIndex(packet);
+        final String[] parts = message.split(SEP);
+        if (parts.length == 0) return;
 
-        System.out.println("[SERVER] Recibido: " + message + " desde " + packet.getAddress() + ":" + packet.getPort());
+        final InetAddress ip = packet.getAddress();
+        final int port = packet.getPort();
+
+        int index = findClientIndex(ip, port);
+
+        System.out.println("[SERVER] Recibido: " + message + " desde " + ip + ":" + port);
 
         // CONNECT
-        if ("Connect".equals(parts[0])) {
+        if (CMD_CONNECT.equals(parts[0])) {
 
             if (index != -1) {
-                sendMessage("AlreadyConnected", packet.getAddress(), packet.getPort());
+                sendMessage(MSG_ALREADY_CONNECTED, ip, port);
                 return;
             }
 
             if (connectedClients >= MAX_CLIENTS) {
-                sendMessage("Full", packet.getAddress(), packet.getPort());
+                sendMessage(MSG_FULL, ip, port);
                 return;
             }
 
             connectedClients++;
-            Client newClient = new Client(connectedClients, packet.getAddress(), packet.getPort());
+            Client newClient = new Client(connectedClients, ip, port);
             clients.add(newClient);
 
-            sendMessage("Connected:" + connectedClients, packet.getAddress(), packet.getPort());
+            sendMessage("Connected:" + connectedClients, ip, port);
 
+            // cuando están los 2 y todavía no arrancó, arranca
             if (connectedClients == MAX_CLIENTS && !partidaArrancada) {
                 partidaArrancada = true;
 
@@ -79,11 +114,9 @@ public class ServerThread extends Thread {
                 nivelPartida = 1;
 
                 sendMessageToAll("Start:" + seedPartida + ":" + nivelPartida);
-
                 System.out.println("[SERVER] Start enviado seed=" + seedPartida + " nivel=" + nivelPartida);
 
                 gameController.startGame();
-
             }
 
             return;
@@ -91,33 +124,44 @@ public class ServerThread extends Thread {
 
         // no connect => debe estar conectado
         if (index == -1) {
-            sendMessage("NotConnected", packet.getAddress(), packet.getPort());
+            sendMessage(MSG_NOT_CONNECTED, ip, port);
             return;
         }
 
         Client client = clients.get(index);
 
         switch (parts[0]) {
-            case "Move": {
+
+            case CMD_MOVE: {
                 // Move:dx:dy
                 if (parts.length >= 3) {
-                    int dx = Integer.parseInt(parts[1]);
-                    int dy = Integer.parseInt(parts[2]);
-                    gameController.move(client.getNum(), dx, dy);
+                    Integer dx = tryParseInt(parts[1]);
+                    Integer dy = tryParseInt(parts[2]);
+                    if (dx != null && dy != null) {
+                        gameController.move(client.getNum(), dx, dy);
+                    } else {
+                        System.out.println("[SERVER] Move mal formado: " + message);
+                    }
                 }
                 break;
             }
 
-            case "Spawn": {
-                int id = Integer.parseInt(parts[1]);
-                float px = Float.parseFloat(parts[2]);
-                float py = Float.parseFloat(parts[3]);
-
-                gameController.spawn(id, px, py);
+            case CMD_SPAWN: {
+                // Spawn:id:px:py
+                if (parts.length >= 4) {
+                    Integer id = tryParseInt(parts[1]);
+                    Float px = tryParseFloat(parts[2]);
+                    Float py = tryParseFloat(parts[3]);
+                    if (id != null && px != null && py != null) {
+                        gameController.spawn(id, px, py);
+                    } else {
+                        System.out.println("[SERVER] Spawn mal formado: " + message);
+                    }
+                }
                 break;
             }
 
-            case "Door": {
+            case CMD_DOOR: {
                 // ✅ soporta ambos formatos:
                 // Viejo: Door:ORIGEN:DESTINO:DIR  (len 4)
                 // Nuevo: Door:PLAYER:ORIGEN:DESTINO:DIR (len 5)
@@ -128,16 +172,21 @@ public class ServerThread extends Thread {
                 String dir;
 
                 if (parts.length >= 5) {
-                    // nuevo
-                    playerNum = Integer.parseInt(parts[1]);
+                    Integer parsedPlayer = tryParseInt(parts[1]);
+                    if (parsedPlayer == null) {
+                        System.out.println("[SERVER] Door mal formado (player): " + message);
+                        break;
+                    }
+                    playerNum = parsedPlayer;
                     origen = parts[2];
                     destino = parts[3];
                     dir = parts[4];
+
                 } else if (parts.length >= 4) {
-                    // viejo
                     origen = parts[1];
                     destino = parts[2];
                     dir = parts[3];
+
                 } else {
                     System.out.println("[SERVER] Door mal formado: " + message);
                     break;
@@ -147,20 +196,30 @@ public class ServerThread extends Thread {
                 gameController.door(playerNum, origen, destino, dir);
                 break;
             }
+
+            default:
+                // ignorar desconocidos
+                break;
         }
     }
 
-    private int findClientIndex(DatagramPacket packet) {
-        String id = packet.getAddress().toString() + ":" + packet.getPort();
+    private int findClientIndex(InetAddress ip, int port) {
+        String id = Client.buildId(ip, port);
         for (int i = 0; i < clients.size(); i++) {
-            if (id.equals(clients.get(i).getId())) return i;
+            if (id.equals(clients.get(i).getId())) {
+                return i;
+            }
         }
         return -1;
     }
 
+
     public void sendMessage(String message, InetAddress clientIp, int clientPort) {
+        if (socket == null || socket.isClosed()) return;
+
         byte[] data = message.getBytes();
         DatagramPacket packet = new DatagramPacket(data, data.length, clientIp, clientPort);
+
         try {
             socket.send(packet);
         } catch (IOException e) {
@@ -176,7 +235,20 @@ public class ServerThread extends Thread {
 
     public void terminate() {
         end = true;
-        if (socket != null && !socket.isClosed()) socket.close();
+
+        DatagramSocket s = socket;
+        if (s != null && !s.isClosed()) s.close();
+
         interrupt();
+    }
+
+    // ===== Helpers parse =====
+
+    private static Integer tryParseInt(String s) {
+        try { return Integer.parseInt(s); } catch (Exception e) { return null; }
+    }
+
+    private static Float tryParseFloat(String s) {
+        try { return Float.parseFloat(s); } catch (Exception e) { return null; }
     }
 }

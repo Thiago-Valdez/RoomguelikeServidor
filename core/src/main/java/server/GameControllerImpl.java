@@ -9,11 +9,16 @@ import interfaces.GameController;
 
 public class GameControllerImpl implements GameController {
 
+    private static final float DT = 1f / 60f;
+    private static final float MOVE_SPEED = 160f;
+    private static final int SLEEP_MS = 5;
+
     private ServerThread server;
 
     private World world;
     private Body b1, b2;
 
+    // índices 1..2 usados
     private final int[] dx = new int[3];
     private final int[] dy = new int[3];
 
@@ -22,11 +27,13 @@ public class GameControllerImpl implements GameController {
     // ✅ map pre-cargado en hilo GL
     private TiledMap map;
 
+    // ✅ temp para evitar alloc por frame
+    private final Vector2 tmpVel = new Vector2();
+
     public void setServer(ServerThread server) {
         this.server = server;
     }
 
-    // ✅ nuevo
     public void setTiledMap(TiledMap map) {
         this.map = map;
     }
@@ -35,8 +42,6 @@ public class GameControllerImpl implements GameController {
     public void startGame() {
         System.out.println("[SERVER] Juego iniciado");
 
-        // ✅ NO cargar TMX acá.
-        // Solo inicializar física usando el map ya cargado.
         initFisicaServidor();
 
         enviarPosiciones();
@@ -102,6 +107,7 @@ public class GameControllerImpl implements GameController {
     public void spawn(int playerNum, float px, float py) {
         Body b = (playerNum == 1) ? b1 : (playerNum == 2 ? b2 : null);
         if (b == null) return;
+
         b.setTransform(px, py, b.getAngle());
         b.setLinearVelocity(0f, 0f);
         enviarPosiciones();
@@ -122,12 +128,11 @@ public class GameControllerImpl implements GameController {
 
         float off = 200f;
         switch (entrada) {
-            case NORTE: cy += off; break; // arriba
-            case SUR:   cy -= off; break; // abajo
-            case ESTE:  cx += off; break; // derecha
-            case OESTE: cx -= off; break; // izquierda
+            case NORTE: cy += off; break;
+            case SUR:   cy -= off; break;
+            case ESTE:  cx += off; break;
+            case OESTE: cx -= off; break;
         }
-
 
         float sep = 24f;
 
@@ -142,14 +147,14 @@ public class GameControllerImpl implements GameController {
         running = true;
 
         new Thread(() -> {
-            final float DT = 1f / 60f;
-
             while (running) {
-                aplicarInputServidor(160f);
+                if (world == null) break;
+
+                aplicarInputServidor(MOVE_SPEED);
                 world.step(DT, 6, 2);
                 enviarPosiciones();
 
-                try { Thread.sleep(5); } catch (InterruptedException ignored) {}
+                try { Thread.sleep(SLEEP_MS); } catch (InterruptedException ignored) {}
             }
         }, "ServerPhysicsLoop").start();
     }
@@ -161,10 +166,12 @@ public class GameControllerImpl implements GameController {
 
     private void aplicarVelocidad(Body b, int dx, int dy, float speed) {
         if (b == null) return;
-        Vector2 v = new Vector2(dx, dy);
-        if (v.len2() > 1f) v.nor();
-        v.scl(speed);
-        b.setLinearVelocity(v);
+
+        tmpVel.set(dx, dy);
+        if (tmpVel.len2() > 1f) tmpVel.nor();
+        tmpVel.scl(speed);
+
+        b.setLinearVelocity(tmpVel);
     }
 
     private void enviarPosiciones() {
