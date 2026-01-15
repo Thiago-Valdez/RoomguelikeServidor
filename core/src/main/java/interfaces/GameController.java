@@ -2,6 +2,9 @@ package interfaces;
 
 public interface GameController {
 
+    /** Configura semilla/nivel de la partida (antes de startGame). */
+    void configure(long seed, int nivel);
+
     /** Arranca la lógica del server (1 sola vez). */
     void startGame();
 

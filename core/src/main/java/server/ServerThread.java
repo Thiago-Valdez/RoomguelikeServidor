@@ -116,6 +116,7 @@ public class ServerThread extends Thread {
                 sendMessageToAll("Start:" + seedPartida + ":" + nivelPartida);
                 System.out.println("[SERVER] Start enviado seed=" + seedPartida + " nivel=" + nivelPartida);
 
+                gameController.configure(seedPartida, nivelPartida);
                 gameController.startGame();
             }
 
@@ -193,7 +194,9 @@ public class ServerThread extends Thread {
                 }
 
                 System.out.println("[SERVER] Door OK -> P" + playerNum + " " + origen + " -> " + destino + " (" + dir + ")");
-                gameController.door(playerNum, origen, destino, dir);
+                // ✅ Puertas ahora son autoritativas por contacto en el server.
+                // Ignoramos mensajes Door desde cliente para evitar desync/cheat.
+                System.out.println("[SERVER] Ignorando Door desde cliente: " + message);
                 break;
             }
 

@@ -4,15 +4,22 @@ import com.badlogic.gdx.maps.tiled.TiledMap;
 import com.badlogic.gdx.math.Vector2;
 import com.badlogic.gdx.physics.box2d.*;
 
+import java.util.*;
+import java.util.function.Consumer;
+
 import fisica.ColisionesDesdeTiled;
+import fisica.FisicaMundo;
 import interfaces.GameController;
+import juego.inicializacion.InicializadorSensoresPuertas;
+import mapa.generacion.*;
+import mapa.model.*;
+import mapa.puertas.DatosPuerta;
 
 public class GameControllerImpl implements GameController {
 
     private static final float DT = 1f / 60f;
     private static final float MOVE_SPEED = 160f;
-    private static final int SLEEP_MS = 5;
-
+    private static final int NET_HZ = 20; // ✅ 20 updates/s (liviano y suficiente)
     private ServerThread server;
 
     private World world;
@@ -24,8 +31,24 @@ public class GameControllerImpl implements GameController {
 
     private volatile boolean running = false;
 
+    // ✅ Red: snapshots a tasa fija
+    private volatile long nextNetSendNs = 0L;
+
     // ✅ map pre-cargado en hilo GL
     private TiledMap map;
+
+    // =====================
+    // Config de partida (para puertas autoritativas)
+    // =====================
+    private long seedPartida = 0L;
+    private int nivelPartida = 1;
+
+    private DisposicionMapa disposicion;
+    private Habitacion salaActual = Habitacion.INICIO_1;
+
+    // Anti-retrigger de puertas (el contacto puede disparar varias veces)
+    private long lastDoorNs = 0L;
+    private static final long DOOR_COOLDOWN_NS = 400_000_000L; // 400ms
 
     // ✅ temp para evitar alloc por frame
     private final Vector2 tmpVel = new Vector2();
@@ -38,13 +61,19 @@ public class GameControllerImpl implements GameController {
         this.map = map;
     }
 
-    @Override
+        @Override
+    public void configure(long seed, int nivel) {
+        this.seedPartida = seed;
+        this.nivelPartida = Math.max(1, nivel);
+    }
+
+@Override
     public void startGame() {
         System.out.println("[SERVER] Juego iniciado");
 
         initFisicaServidor();
 
-        enviarPosiciones();
+        enviarPosiciones(true);
         startLoop();
     }
 
@@ -71,6 +100,46 @@ public class GameControllerImpl implements GameController {
 
         b1.setLinearDamping(6f);
         b2.setLinearDamping(6f);
+
+
+        // ✅ Identificar bodies para saber qué jugador tocó la puerta
+        b1.setUserData(1);
+        b2.setUserData(2);
+
+        // ✅ Generar disposición + sensores de puertas en el SERVER (autoritativo)
+        GeneradorMapa.Configuracion cfg = new GeneradorMapa.Configuracion();
+        cfg.nivel = Math.max(1, nivelPartida);
+        cfg.semilla = seedPartida;
+
+        List<Habitacion> todasLasHabitaciones = Arrays.asList(Habitacion.values());
+        GrafoPuertas grafo = new GrafoPuertas(todasLasHabitaciones, new Random(cfg.semilla));
+
+        GeneradorMapa generador = new GeneradorMapa(cfg, grafo);
+        disposicion = generador.generar();
+        salaActual = disposicion.salaInicio();
+
+        // Creamos sensores de puertas para TODA la disposición (fixtures con userData = DatosPuerta)
+        FisicaMundo fisica = new FisicaMundo(world);
+        InicializadorSensoresPuertas.generarSensoresPuertas(
+            fisica,
+            disposicion,
+            reg -> { /* no necesitamos visuales en server */ }
+        );
+
+
+        // ✅ Puertas autoritativas: el SERVER detecta el contacto y emite UpdateRoom
+        world.setContactListener(new ContactListener() {
+            @Override
+            public void beginContact(Contact contact) {
+                Fixture a = contact.getFixtureA();
+                Fixture b = contact.getFixtureB();
+                tryDoor(a, b);
+                tryDoor(b, a);
+            }
+            @Override public void endContact(Contact contact) {}
+            @Override public void preSolve(Contact contact, Manifold oldManifold) {}
+            @Override public void postSolve(Contact contact, ContactImpulse impulse) {}
+        });
     }
 
     private Body crearJugadorBody(float px, float py) {
@@ -110,7 +179,7 @@ public class GameControllerImpl implements GameController {
 
         b.setTransform(px, py, b.getAngle());
         b.setLinearVelocity(0f, 0f);
-        enviarPosiciones();
+        enviarPosiciones(true);
     }
 
     @Override
@@ -139,22 +208,88 @@ public class GameControllerImpl implements GameController {
         if (b1 != null) { b1.setTransform(cx - sep, cy, b1.getAngle()); b1.setLinearVelocity(0,0); }
         if (b2 != null) { b2.setTransform(cx + sep, cy, b2.getAngle()); b2.setLinearVelocity(0,0); }
 
-        enviarPosiciones();
+        enviarPosiciones(true);
+    }
+
+
+    private void tryDoor(Fixture jugadorFx, Fixture otroFx) {
+        if (jugadorFx == null || otroFx == null) return;
+
+        // jugador fixture identificada por userData = "jugador"
+        if (!"jugador".equals(jugadorFx.getUserData())) return;
+
+        Object ud = otroFx.getUserData();
+        if (!(ud instanceof DatosPuerta puerta)) return;
+
+        // Solo vale si estoy en la sala ORIGEN de esa puerta
+        if (puerta.origen() != salaActual) return;
+
+        // cooldown (evita disparos múltiples por el mismo contacto)
+        long now = System.nanoTime();
+        if (now - lastDoorNs < DOOR_COOLDOWN_NS) return;
+        lastDoorNs = now;
+
+        Object bUd = jugadorFx.getBody() != null ? jugadorFx.getBody().getUserData() : null;
+        int playerNum = (bUd instanceof Integer i) ? i : 1;
+
+        // Ejecuta transición autoritativa (teleporta + UpdateRoom + snapshot)
+        door(
+            playerNum,
+            puerta.origen().name(),
+            puerta.destino().name(),
+            puerta.direccion().name()
+        );
+
+
+
+        // En tu juego ambos jugadores viajan juntos (door() teleporta a ambos)
+        salaActual = puerta.destino();
     }
 
     private void startLoop() {
         if (running) return;
         running = true;
 
+        // ✅ Física a 60Hz en tiempo real + snapshots de red a tasa fija (NET_HZ).
         new Thread(() -> {
+            final long stepNs = (long) (DT * 1_000_000_000L);
+            final long netNs = 1_000_000_000L / NET_HZ;
+
+            long nextStep = System.nanoTime();
+            nextNetSendNs = nextStep; // primer snapshot inmediato
+
             while (running) {
                 if (world == null) break;
 
-                aplicarInputServidor(MOVE_SPEED);
-                world.step(DT, 6, 2);
-                enviarPosiciones();
+                long now = System.nanoTime();
 
-                try { Thread.sleep(SLEEP_MS); } catch (InterruptedException ignored) {}
+                // Dormimos hasta el próximo step de física si vamos antes.
+                if (now < nextStep) {
+                    long sleepNs = nextStep - now;
+                    try {
+                        Thread.sleep(sleepNs / 1_000_000L, (int) (sleepNs % 1_000_000L));
+                    } catch (InterruptedException ignored) {}
+                    continue;
+                }
+
+                // Catch-up limitado (evita espiral de muerte si hay un spike)
+                int steps = 0;
+                while (now >= nextStep && steps < 5) {
+                    aplicarInputServidor(MOVE_SPEED);
+                    world.step(DT, 6, 2);
+                    nextStep += stepNs;
+                    steps++;
+                }
+
+                // Snapshot de red a tasa fija
+                now = System.nanoTime();
+                if (now >= nextNetSendNs) {
+                    enviarPosiciones(false);
+                    // avanza el siguiente tick sin drift
+                    do {
+                        nextNetSendNs += netNs;
+                    } while (now >= nextNetSendNs);
+                }
             }
         }, "ServerPhysicsLoop").start();
     }
@@ -174,8 +309,14 @@ public class GameControllerImpl implements GameController {
         b.setLinearVelocity(tmpVel);
     }
 
-    private void enviarPosiciones() {
+    private void enviarPosiciones(boolean force) {
         if (server == null) return;
+
+        // Si forzamos (spawn/door/start), adelantamos el siguiente tick de red para evitar doble envío inmediato.
+        if (force) {
+            long now = System.nanoTime();
+            nextNetSendNs = now + (1_000_000_000L / NET_HZ);
+        }
 
         if (b1 != null) {
             Vector2 p1 = b1.getPosition();
