@@ -1,5 +1,6 @@
 package server;
 
+import com.badlogic.gdx.Gdx;
 import interfaces.GameController;
 
 import java.io.IOException;
@@ -19,6 +20,7 @@ public class ServerThread extends Thread {
     private static final String CMD_MOVE = "Move";
     private static final String CMD_SPAWN = "Spawn";
     private static final String CMD_DOOR = "Door";
+    private static final String CMD_ROOMCLEAR = "RoomClearReq";
 
     private static final String MSG_ALREADY_CONNECTED = "AlreadyConnected";
     private static final String MSG_FULL = "Full";
@@ -68,7 +70,10 @@ public class ServerThread extends Thread {
                 if (!end) System.out.println("[SERVER] IO: " + e.getMessage());
             } catch (Exception e) {
                 // ✅ evita que el server thread muera por mensajes raros
-                if (!end) System.out.println("[SERVER] Unexpected: " + e.getMessage());
+                if (!end) {
+                    System.out.println("[SERVER] Unexpected: " + e.getMessage());
+                    e.printStackTrace();
+                }
             }
         }
     }
@@ -116,7 +121,21 @@ public class ServerThread extends Thread {
                 sendMessageToAll("Start:" + seedPartida + ":" + nivelPartida);
                 System.out.println("[SERVER] Start enviado seed=" + seedPartida + " nivel=" + nivelPartida);
 
-                gameController.startGame();
+                gameController.configure(seedPartida, nivelPartida);
+
+                // ✅ IMPORTANTE: startGame() crea/usa recursos de LibGDX que requieren
+                // un contexto GL current. El hilo de red (ServerThread) NO tiene contexto.
+                // Lo ejecutamos en el hilo principal de LibGDX.
+                Gdx.app.postRunnable(() -> {
+                    try {
+                        gameController.startGame();
+                    } catch (Throwable t) {
+                        System.out.println("[SERVER] startGame() explotó: " + t.getMessage());
+                        t.printStackTrace();
+                        // dejamos el thread vivo para que puedas volver a intentar
+                        partidaArrancada = false;
+                    }
+                });
             }
 
             return;
@@ -177,6 +196,7 @@ public class ServerThread extends Thread {
                         System.out.println("[SERVER] Door mal formado (player): " + message);
                         break;
                     }
+
                     playerNum = parsedPlayer;
                     origen = parts[2];
                     destino = parts[3];
@@ -193,7 +213,20 @@ public class ServerThread extends Thread {
                 }
 
                 System.out.println("[SERVER] Door OK -> P" + playerNum + " " + origen + " -> " + destino + " (" + dir + ")");
-                gameController.door(playerNum, origen, destino, dir);
+                // ✅ Puertas ahora son autoritativas por contacto en el server.
+                // Ignoramos mensajes Door desde cliente para evitar desync/cheat.
+                System.out.println("[SERVER] Ignorando Door desde cliente: " + message);
+                break;
+            }
+
+            case CMD_ROOMCLEAR: {
+                // RoomClearReq:sala
+                if (parts.length >= 2) {
+                    String sala = parts[1];
+                    if (sala != null && !sala.isBlank()) {
+                        gameController.roomClearRequest(client.getNum(), sala.trim());
+                    }
+                }
                 break;
             }
 
@@ -231,6 +264,31 @@ public class ServerThread extends Thread {
         for (Client client : clients) {
             sendMessage(message, client.getIp(), client.getPort());
         }
+    }
+
+    /** Envia un mensaje SOLO al cliente asociado a ese playerNum (1..MAX_CLIENTS). */
+    public void sendMessageToPlayer(int playerNum, String message) {
+        if (playerNum < 1) return;
+        for (Client client : clients) {
+            if (client.getNum() == playerNum) {
+                sendMessage(message, client.getIp(), client.getPort());
+                return;
+            }
+        }
+    }
+
+    /**
+     * Reinicia el "lobby" para permitir que se conecten 2 clientes nuevos
+     * sin tener que reiniciar el server. No cierra el socket.
+     * Se usa cuando termina una partida (GameOver/Victoria).
+     */
+    public synchronized void resetLobby() {
+        connectedClients = 0;
+        clients.clear();
+        partidaArrancada = false;
+        seedPartida = 0L;
+        nivelPartida = 1;
+        System.out.println("[SERVER] Lobby reseteado (esperando nuevos Connect)");
     }
 
     public void terminate() {

@@ -21,14 +21,18 @@ public class FisicaMundo {
 
 
     private final World world;
-    private final Box2DDebugRenderer debugRenderer;
+    // Box2DDebugRenderer crea recursos OpenGL (ShapeRenderer/Shader) al construirse.
+    // En el servidor, la fisica corre en un thread sin contexto GL, asi que NO podemos
+    // instanciarlo aca. Si alguna vez quisieras debugDraw en desktop, inicializalo
+    // de forma lazy en el thread de render.
+    private Box2DDebugRenderer debugRenderer;
 
     /**
      * NO crea un World nuevo: usa el que le pasás.
      */
     public FisicaMundo(World world) {
         this.world = world;
-        this.debugRenderer = new Box2DDebugRenderer();
+        this.debugRenderer = null;
     }
 
     public World world() {
@@ -86,7 +90,10 @@ public class FisicaMundo {
      * La cámara ya está en píxeles y los cuerpos también.
      */
     public void debugDraw(OrthographicCamera camara) {
-        //debugRenderer.render(world, camara.combined);
+        // NO-OP por defecto.
+        // Si queres habilitar debug en un build con contexto GL, descomenta:
+        // if (debugRenderer == null) debugRenderer = new Box2DDebugRenderer();
+        // debugRenderer.render(world, camara.combined);
     }
 
     /**

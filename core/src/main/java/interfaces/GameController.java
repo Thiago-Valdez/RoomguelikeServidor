@@ -2,6 +2,9 @@ package interfaces;
 
 public interface GameController {
 
+    /** Configura semilla/nivel de la partida (antes de startGame). */
+    void configure(long seed, int nivel);
+
     /** Arranca la lógica del server (1 sola vez). */
     void startGame();
 
@@ -13,4 +16,7 @@ public interface GameController {
 
     /** Evento puerta: cambio de sala autoritativo (server). */
     void door(int playerNum, String origen, String destino, String dir);
+
+    /** Request de sala despejada (puzzle resuelto) desde un cliente. */
+    void roomClearRequest(int playerNum, String sala);
 }

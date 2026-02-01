@@ -283,6 +283,16 @@ public class GestorDeEntidades {
         jugador.agregarObjeto(item);
         jugador.reaplicarEfectosDeItems(); // ✅ esto es clave para stats (velocidad, vidaMax, etc.)
 
+        removerItemDelMundo(item);
+    }
+
+    /**
+     * Remueve un item del mundo sin aplicar efectos a ningún jugador.
+     * Útil para modo ONLINE autoritativo donde el server decide el pickup.
+     */
+    public void removerItemDelMundo(Item item) {
+        if (item == null) return;
+
         Body body = cuerposItems.remove(item);
         if (body != null) world.destroyBody(body);
         itemsMundo.remove(item);

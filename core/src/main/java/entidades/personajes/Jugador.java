@@ -22,7 +22,6 @@ public class Jugador extends Entidad {
     private int vidaMaxima;
 
     private float velocidadBase = 100f;
-    private float velocidadActual = 100f;
 
     private boolean puedeMoverse = true;
     private float cooldownDanio = 0f;
@@ -172,8 +171,16 @@ public class Jugador extends Entidad {
         updateEstado(delta);
     }
 
+    @Override
     public float getVelocidad() {
-        return velocidadActual;
+        // La velocidad efectiva del jugador vive en Entidad.velocidad.
+        // (Los items llaman jugador.getVelocidad()/setVelocidad(), así que tiene que ser consistente.)
+        return super.getVelocidad();
+    }
+
+    @Override
+    public void setVelocidad(float velocidad) {
+        super.setVelocidad(velocidad);
     }
 
     public void marcarHitCooldown(float segundos) {
@@ -203,7 +210,10 @@ public class Jugador extends Entidad {
     public void reaplicarEfectosDeItems() {
         // reset a base
         this.vidaMaxima = 3;
-        this.velocidad = 100f; // <-- esto está bien SOLO si se llama siempre después de cada cambio
+        this.velocidadBase = 100f;
+        // Importante: el gameplay usa Entidad.velocidad (via getVelocidad),
+        // así que reseteamos ahí.
+        super.setVelocidad(velocidadBase);
 
         if (vida > vidaMaxima) vida = vidaMaxima;
 
