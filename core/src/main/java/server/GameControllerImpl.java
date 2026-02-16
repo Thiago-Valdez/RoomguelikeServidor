@@ -1,5 +1,6 @@
 package server;
 
+import com.badlogic.gdx.Gdx;
 import com.badlogic.gdx.maps.tiled.TiledMap;
 import com.badlogic.gdx.math.Vector2;
 import com.badlogic.gdx.physics.box2d.*;
@@ -14,6 +15,7 @@ import juego.inicializacion.InicializadorSensoresPuertas;
 import mapa.generacion.*;
 import mapa.model.*;
 import mapa.puertas.DatosPuerta;
+import mapa.trampilla.DatosTrampilla;
 import entidades.GestorDeEntidades;
 import entidades.enemigos.Enemigo;
 import entidades.enemigos.EnemigosDesdeTiled;
@@ -45,6 +47,16 @@ public class GameControllerImpl implements GameController {
     private final int[] dy = new int[3];
 
     private volatile boolean running = false;
+
+    // ✅ Física corre en hilo dedicado
+    private volatile Thread physicsThread = null;
+
+    // ==================================================
+    // ✅ Stop modes
+    // - fullReset=true  : fin de partida / reinicio total (borra jugadores)
+    // - fullReset=false : cambio de nivel (conserva inventario/vida/stats)
+    // ==================================================
+    private volatile boolean stopFullReset = true;
 
     // ✅ Red: snapshots a tasa fija
     private volatile long nextNetSendNs = 0L;
@@ -142,6 +154,19 @@ private static class PendingRoomClear {
     private volatile PendingDoor pendingDoor = null;
     private volatile PendingRoomClear pendingRoomClear = null;
 
+    // =====================
+    // Fin de nivel (server autoritativo)
+    // =====================
+    private FisicaMundo fisicaMundo;
+    private Body trampillaBody;
+    private Habitacion salaTrampilla;
+    private volatile boolean advanceLevelRequested = false;
+    private volatile boolean advancingLevelNow = false;
+    private long lastAdvanceNs = 0L;
+    private static final long ADVANCE_COOLDOWN_NS = 1_000_000_000L; // 1s
+    private static final int NIVEL_MAX = 3;
+
+
     // ✅ temp para evitar alloc por frame
     private final Vector2 tmpVel = new Vector2();
 
@@ -181,6 +206,28 @@ private static class PendingRoomClear {
             throw new IllegalStateException("TiledMap no seteado. Llamá setTiledMap(map) antes de startGame().");
         }
 
+        // ✅ limpiar estado por nivel
+        salasDespejadas.clear();
+        salasConEnemigos.clear();
+
+        idPorItem.clear();
+        itemPorId.clear();
+        nextItemId = 1;
+
+        idPorEnemigo.clear();
+        enemigoPorId.clear();
+        nextEnemyId = 1;
+
+        pendingDamages.clear();
+        damagesEncolados.clear();
+        pendingPickups.clear();
+        pickupsEncolados.clear();
+
+        pendingDoor = null;
+        pendingRoomClear = null;
+
+        limpiarTrampilla();
+
         if (world != null) {
             world.dispose();
             world = null;
@@ -191,25 +238,7 @@ private static class PendingRoomClear {
         // ✅ colisiones desde Tiled
         ColisionesDesdeTiled.crearColisiones(map, world);
 
-        b1 = crearJugadorBody(224f, 2304f);
-        b2 = crearJugadorBody(288f, 2304f);
-
-        b1.setBullet(true);
-        b2.setBullet(true);
-
-        b1.setLinearDamping(6f);
-        b2.setLinearDamping(6f);
-
-
-        // ✅ Jugadores autoritativos: stats/inventario viven en server.
-        j1 = new Jugador(1, "J1", Genero.MASCULINO, Estilo.CLASICO);
-        j2 = new Jugador(2, "J2", Genero.FEMENINO, Estilo.CLASICO);
-
-        // Importante: Jugador.setCuerpoFisico setea body.userData = Jugador
-        j1.setCuerpoFisico(b1);
-        j2.setCuerpoFisico(b2);
-
-        // ✅ Generar disposición + sensores de puertas en el SERVER (autoritativo)
+        // ✅ Generar disposición (server autoritativo)
         GeneradorMapa.Configuracion cfg = new GeneradorMapa.Configuracion();
         cfg.nivel = Math.max(1, nivelPartida);
         cfg.semilla = seedPartida;
@@ -221,18 +250,51 @@ private static class PendingRoomClear {
         disposicion = generador.generar();
         salaActual = disposicion.salaInicio();
 
-        // Creamos sensores de puertas para TODA la disposición (fixtures con userData = DatosPuerta)
-        FisicaMundo fisica = new FisicaMundo(world);
-        InicializadorSensoresPuertas.generarSensoresPuertas(fisica, disposicion, reg -> { /* no necesitamos visuales en server */ });
+        // ✅ Spawn basado en sala INICIO (evita hardcodes que rompen entre niveles)
+        Vector2 sp1 = calcularSpawnJugador(salaActual, 1);
+        Vector2 sp2 = calcularSpawnJugador(salaActual, 2);
 
-        // ✅ Gestor de entidades también corre en server para spawnear items (BOTIN) y procesar pickups.
+        b1 = crearJugadorBody(sp1.x, sp1.y);
+        b2 = crearJugadorBody(sp2.x, sp2.y);
+
+        b1.setBullet(true);
+        b2.setBullet(true);
+
+        b1.setLinearDamping(6f);
+        b2.setLinearDamping(6f);
+
+        // ✅ Jugadores autoritativos: stats/inventario viven en server.
+        // Al pasar de nivel NO recreamos jugadores (si no se pierde inventario/vida).
+        if (j1 == null) j1 = new Jugador(1, "J1", Genero.MASCULINO, Estilo.CLASICO);
+        if (j2 == null) j2 = new Jugador(2, "J2", Genero.FEMENINO, Estilo.CLASICO);
+
+        // Importante: Jugador.setCuerpoFisico setea body.userData = Jugador
+        j1.setCuerpoFisico(b1);
+        j2.setCuerpoFisico(b2);
+
+        // ✅ Asegura que stats dependientes de items (velocidad/vidaMax) estén aplicados al iniciar el nivel.
+        // (Idempotente: no debe curar ni resetear vida actual.)
+        try { j1.reaplicarEfectosDeItems(); } catch (Exception ignored) {}
+        try { j2.reaplicarEfectosDeItems(); } catch (Exception ignored) {}
+
+        // ✅ Sensores de puertas en el SERVER (autoritativo)
+        fisicaMundo = new FisicaMundo(world);
+        InicializadorSensoresPuertas.generarSensoresPuertas(fisicaMundo, disposicion, reg -> { /* no visuales */ });
+
+        // ✅ Gestor de entidades en server (items + enemigos)
         gestorEntidades = new GestorDeEntidades(world);
+        // ✅ CRÍTICO: si el gestor es nuevo, hay que volver a registrar jugadores,
+        // si no, el HUD/estado del cliente puede "volver a defaults".
+        try { gestorEntidades.registrarJugador(j1); } catch (Exception ignored) {}
+        try { gestorEntidades.registrarJugador(j2); } catch (Exception ignored) {}
+
+        // ✅ estado inicial: sala inicio siempre despejada
+        salasDespejadas.add(salaActual);
 
         // ✅ Enemigos autoritativos: spawnea los enemigos definidos en Tiled para la sala inicial
-        // (y los sincroniza por red al cliente).
         spawnearEnemigosDeSalaSiHaceFalta(salaActual);
 
-        // ✅ Puertas autoritativas: el SERVER detecta el contacto y emite UpdateRoom
+        // ✅ Puertas/Items/Daño/Trampilla: el SERVER detecta contacto y emite eventos
         world.setContactListener(new ContactListener() {
             @Override
             public void beginContact(Contact contact) {
@@ -248,11 +310,38 @@ private static class PendingRoomClear {
                 // ⚔️ Daño autoritativo (jugador <-> enemigo)
                 tryDamage(a, b);
                 tryDamage(b, a);
+
+                // 🕳️ Fin de nivel autoritativo (trampilla)
+                tryFinNivel(a, b);
+                tryFinNivel(b, a);
             }
             @Override public void endContact(Contact contact) {}
             @Override public void preSolve(Contact contact, Manifold oldManifold) {}
             @Override public void postSolve(Contact contact, ContactImpulse impulse) {}
         });
+    }
+
+    private Vector2 calcularSpawnJugador(Habitacion sala, int playerNum) {
+        if (sala == null) return new Vector2(0f, 0f);
+        float baseX = sala.gridX * sala.ancho;
+        float baseY = sala.gridY * sala.alto;
+
+        float cx = baseX + sala.ancho / 2f;
+        float cy = baseY + sala.alto / 2f;
+
+        float off = 32f;
+        float x = (playerNum == 2) ? (cx + off) : (cx - off);
+        float y = cy;
+
+        return new Vector2(x, y);
+    }
+
+    private void limpiarTrampilla() {
+        if (fisicaMundo != null && trampillaBody != null) {
+            try { fisicaMundo.destruirBody(trampillaBody); } catch (Exception ignored) {}
+        }
+        trampillaBody = null;
+        salaTrampilla = null;
     }
 
     private void tryPickup(Fixture jugadorFx, Fixture otroFx) {
@@ -387,6 +476,18 @@ public void roomClearRequest(int playerNum, String sala) {
     } catch (IllegalArgumentException ignored) {}
 }
 
+@Override
+public void nextLevelRequest(int playerNum) {
+    // Fallback: sólo aceptamos si estamos en JEFE y está despejada.
+    if (salaActual == null) return;
+    if (!salaActual.name().startsWith("JEFE")) return;
+    if (!salaEstaDespejada(salaActual)) return;
+
+    long now = System.nanoTime();
+    if (now - lastAdvanceNs < ADVANCE_COOLDOWN_NS) return;
+    lastAdvanceNs = now;
+    advanceLevelRequested = true;
+}
 
 
 
@@ -424,12 +525,39 @@ public void roomClearRequest(int playerNum, String sala) {
         }
     }
 
+    // 🕳️ Fin de nivel autoritativo (trampilla)
+    // Se llama desde beginContact. IMPORTANTE: NO avanzar el nivel directamente dentro del callback de Box2D.
+    // Solo encolamos la solicitud y el loop la procesa fuera del step.
+    private void tryFinNivel(Fixture jugadorFx, Fixture otroFx) {
+        if (jugadorFx == null || otroFx == null) return;
+
+        // El fixture del jugador se marca con userData = "jugador"
+        if (!"jugador".equals(jugadorFx.getUserData())) return;
+
+        // El sensor de trampilla usa DatosTrampilla como userData
+        Object ud = otroFx.getUserData();
+        if (!(ud instanceof DatosTrampilla)) return;
+
+        // Anti-retrigger (múltiples beginContact seguidos)
+        long now = System.nanoTime();
+        if (now - lastAdvanceNs < ADVANCE_COOLDOWN_NS) return;
+        lastAdvanceNs = now;
+
+        // Seguridad extra: solo permitir avanzar desde sala JEFE despejada
+        if (salaActual == null) return;
+        if (!salaActual.name().startsWith("JEFE")) return;
+        if (!salaEstaDespejada(salaActual)) return;
+
+        advanceLevelRequested = true;
+    }
+
+
     private void startLoop() {
         if (running) return;
         running = true;
 
         // ✅ Física a 60Hz en tiempo real + snapshots de red a tasa fija (NET_HZ).
-        new Thread(() -> {
+        Thread physicsThreadLocal = new Thread(() -> {
             final long stepNs = (long) (DT * 1_000_000_000L);
             final long netNs = 1_000_000_000L / NET_HZ;
             final long hudNs = 1_000_000_000L / HUD_HZ;
@@ -437,6 +565,8 @@ public void roomClearRequest(int playerNum, String sala) {
             long nextStep = System.nanoTime();
             nextNetSendNs = nextStep; // primer snapshot inmediato
             nextHudSendNs = nextStep; // primer HUD inmediato
+
+            try {
 
             while (running) {
                 if (world == null) break;
@@ -475,6 +605,18 @@ public void roomClearRequest(int playerNum, String sala) {
                 // ✅ Update de enemigos solo en la sala actual (AI simple)
                 if (gestorEntidades != null && salaActual != null) {
                     actualizarEnemigosDeSalaActual(DT);
+                }
+
+                // ✅ Auto-clear dinámico para COMBATE/JEFE cuando ya no quedan enemigos.
+                checkAutoClearSalaActual();
+
+                // ✅ En JEFE: si la sala está despejada, spawneamos trampilla autoritativa.
+                actualizarTrampilla();
+
+                // ✅ Fin de nivel autoritativo
+                if (advanceLevelRequested) {
+                    advanceLevelRequested = false;
+                    solicitarAvanceNivel();
                 }
 
                 // ✅ Procesar transición de puerta fuera de callbacks de colisión.
@@ -527,8 +669,125 @@ public void roomClearRequest(int playerNum, String sala) {
                 }
 
             }
-        }, "ServerPhysicsLoop").start();
+
+            } finally {
+                // ✅ Cleanup seguro: no dejamos un World vivo mientras otro hilo podría recrearlo.
+                try {
+                    if (world != null) world.dispose();
+                } catch (Exception ignored) {}
+                world = null;
+                b1 = null;
+                b2 = null;
+
+                // ✅ Importante: al pasar de nivel NO borramos jugadores.
+                // Solo soltamos sus bodies (ya no válidos porque el World se destruyó).
+                if (stopFullReset) {
+                    j1 = null;
+                    j2 = null;
+                } else {
+                    try { if (j1 != null) j1.setCuerpoFisico(null); } catch (Exception ignored) {}
+                    try { if (j2 != null) j2.setCuerpoFisico(null); } catch (Exception ignored) {}
+                }
+
+                trampillaBody = null;
+                salaTrampilla = null;
+                fisicaMundo = null;
+                physicsThread = null;
+            }
+        }, "ServerPhysicsLoop");
+            physicsThread = physicsThreadLocal;
+            physicsThreadLocal.start();
+}
+
+
+    private void checkAutoClearSalaActual() {
+        if (server == null || gestorEntidades == null || salaActual == null) return;
+        if (!requiereSalaDespejada(salaActual)) return;
+        if (!autoClearSiNoHayEnemigos(salaActual)) return;
+        if (salasDespejadas.contains(salaActual)) return;
+
+        int count = gestorEntidades.getEnemigosDeSala(salaActual).size();
+        if (count == 0) {
+            salasDespejadas.add(salaActual);
+            server.sendMessageToAll("RoomClear:" + salaActual.name());
+        }
     }
+
+    private void actualizarTrampilla() {
+        if (fisicaMundo == null || salaActual == null) return;
+
+        // Si cambiamos de sala, destruimos la trampilla previa.
+        if (salaTrampilla != null && salaActual != salaTrampilla) {
+            limpiarTrampilla();
+        }
+
+        // Solo en JEFE, y solo cuando la sala esté resuelta (server autoritativo)
+        if (!salaActual.name().startsWith("JEFE")) return;
+        if (!salaEstaDespejada(salaActual)) return;
+
+        if (trampillaBody != null) return;
+
+        float size = 16f;
+        float baseX = salaActual.gridX * salaActual.ancho;
+        float baseY = salaActual.gridY * salaActual.alto;
+        float x = baseX + salaActual.ancho / 2f - size / 2f;
+        float y = baseY + salaActual.alto / 2f - size / 2f;
+
+        DatosTrampilla dt = new DatosTrampilla(salaActual);
+        trampillaBody = fisicaMundo.crearSensorCaja(x, y, size, size, dt);
+        salaTrampilla = salaActual;
+    }
+
+    private void solicitarAvanceNivel() {
+        if (advancingLevelNow) return;
+        if (server == null) return;
+
+        advancingLevelNow = true;
+
+        // Ejecutamos el reinicio del nivel en el hilo principal de LibGDX.
+        Gdx.app.postRunnable(() -> {
+            try {
+                avanzarNivelAutoritativo();
+            } catch (Throwable t) {
+                System.out.println("[SERVER] Error avanzando nivel: " + t.getMessage());
+                t.printStackTrace();
+            } finally {
+                advancingLevelNow = false;
+            }
+        });
+    }
+
+    private void avanzarNivelAutoritativo() {
+
+        // ✅ Si se completó el nivel 3 -> fin del juego
+        if (nivelPartida >= NIVEL_MAX) {
+            if (server != null) {
+                server.sendMessageToAll("Win");
+                System.out.println("[SERVER] WIN enviado (se completaron " + NIVEL_MAX + " niveles)");
+            }
+
+            // detener simulación
+            try { stop(); } catch (Throwable ignored) {}
+
+            // liberar lobby para volver a jugar sin reiniciar server
+            if (server != null) server.resetLobby();
+            return;
+        }
+
+        // ✅ Caso normal: pasar al siguiente nivel
+        nivelPartida += 1;
+        seedPartida = System.currentTimeMillis();
+
+        if (server != null) {
+            server.sendMessageToAll("Start:" + seedPartida + ":" + nivelPartida);
+            System.out.println("[SERVER] Start enviado seed=" + seedPartida + " nivel=" + nivelPartida);
+        }
+
+        // ✅ Cambio de nivel: detenemos simulación sin borrar jugadores.
+        stop(false);
+        startGame();
+    }
+
 
     private void enviarSpawnsItemsNuevos() {
         if (server == null || gestorEntidades == null) return;
@@ -890,14 +1149,61 @@ private void procesarDaniosPendientes() {
         }
     }
 
-    public void stop() {
+    /**
+     * ✅ ONLINE: snapshot autoritativo de HUD para un cliente.
+     * Se usa cuando el cliente avisa "Ready" luego de recrear el World (inicio de partida o cambio de nivel).
+     * Envía: Hud (vida/vidaMax/inventario) + Other (vida del otro jugador).
+     */
+    public void enviarSnapshotHudPara(int playerNum) {
+        try { enviarHud(playerNum); } catch (Exception ignored) {}
+        try { enviarOtherStateTo(playerNum); } catch (Exception ignored) {}
+    }
+
+    /**
+     * Detiene el loop de física.
+     * @param fullReset si es true, se borran jugadores (fin de partida).
+     *                 si es false, se conservan jugadores/inventario/vida (cambio de nivel).
+     */
+    public void stop(boolean fullReset) {
+        // ✅ El finally del hilo decide si nullear jugadores.
+        stopFullReset = fullReset;
+
+        // Señalamos al loop de física que termine.
         running = false;
-        if (world != null) world.dispose();
-        world = null;
+
+        // Esperamos a que el hilo de física salga antes de tocar Box2D.
+        Thread t = physicsThread;
+        if (t != null && t != Thread.currentThread()) {
+            try {
+                t.join(2000);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        // Si por algún motivo el hilo ya no existe y el world sigue vivo, liberamos acá.
+        if ((t == null || !t.isAlive()) && world != null) {
+            try { world.dispose(); } catch (Exception ignored) {}
+            world = null;
+        }
+
         b1 = null;
         b2 = null;
-        j1 = null;
-        j2 = null;
-        map = null;
+        if (fullReset) {
+            j1 = null;
+            j2 = null;
+        } else {
+            // bodies ya no sirven: se recrean en initFisicaServidor
+            try { if (j1 != null) j1.setCuerpoFisico(null); } catch (Exception ignored) {}
+            try { if (j2 != null) j2.setCuerpoFisico(null); } catch (Exception ignored) {}
+        }
+        trampillaBody = null;
+        salaTrampilla = null;
+        fisicaMundo = null;
+        physicsThread = null;
+    }
+
+    public void stop() {
+        stop(true);
     }
 }

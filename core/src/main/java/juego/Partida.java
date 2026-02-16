@@ -297,9 +297,9 @@ public class Partida {
         jugador1.reaplicarEfectosDeItems();
         jugador2.reaplicarEfectosDeItems();
 
-        // ✅ 8) Asegurar que los bodies de los jugadores correspondan al *world actual*
-        // (si tu InicializadorPartida ya crea los bodies, perfecto; si no, forzá respawn acá)
-        gestorEntidades.forzarRespawnJugadoresEnWorldActual(jugador1, jugador2, salaActual);
+        if (gestorEntidades != null && jugador1 != null && jugador2 != null && salaActual != null) {
+            gestorEntidades.forzarRespawnJugadoresEnWorldActual(jugador1, jugador2, salaActual);
+        }
     }
 
 

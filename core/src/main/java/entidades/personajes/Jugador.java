@@ -39,8 +39,8 @@ public class Jugador extends Entidad {
         this.genero = (generoInicial != null) ? generoInicial : Genero.MASCULINO;
         this.estilo = (estiloInicial != null) ? estiloInicial : Estilo.CLASICO;
 
-        this.vidaMaxima = 3;
-        this.vida = 3;
+        this.vidaMaxima = 6;
+        this.vida = 6;
 
         // velocidad ya quedó seteada en super(nombre, 200f, null)
     }
@@ -209,7 +209,7 @@ public class Jugador extends Entidad {
 
     public void reaplicarEfectosDeItems() {
         // reset a base
-        this.vidaMaxima = 3;
+        this.vidaMaxima = 6;
         this.velocidadBase = 100f;
         // Importante: el gameplay usa Entidad.velocidad (via getVelocidad),
         // así que reseteamos ahí.

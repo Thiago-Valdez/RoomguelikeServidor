@@ -21,6 +21,8 @@ public class ServerThread extends Thread {
     private static final String CMD_SPAWN = "Spawn";
     private static final String CMD_DOOR = "Door";
     private static final String CMD_ROOMCLEAR = "RoomClearReq";
+    private static final String CMD_NEXTLEVEL = "NextLevelReq";
+    private static final String CMD_READY = "Ready";
 
     private static final String MSG_ALREADY_CONNECTED = "AlreadyConnected";
     private static final String MSG_FULL = "Full";
@@ -226,6 +228,33 @@ public class ServerThread extends Thread {
                     if (sala != null && !sala.isBlank()) {
                         gameController.roomClearRequest(client.getNum(), sala.trim());
                     }
+                }
+                break;
+            }
+
+            case CMD_NEXTLEVEL: {
+                // NextLevelReq (fallback): el server valida si corresponde avanzar.
+                gameController.nextLevelRequest(client.getNum());
+                break;
+            }
+
+            case CMD_READY: {
+                // Ready (opcional: Ready:playerId)
+                // El cliente avisa que ya recreó su World y está listo para recibir snapshot de HUD.
+                int playerNum = client.getNum();
+                Integer parsed = (parts.length >= 2) ? tryParseInt(parts[1]) : null;
+                if (parsed != null) playerNum = parsed;
+
+                if (gameController instanceof server.GameControllerImpl) {
+                    int finalPlayerNum = playerNum;
+                    // Lo hacemos en el hilo principal para leer estado consistente.
+                    Gdx.app.postRunnable(() -> {
+                        try {
+                            ((server.GameControllerImpl) gameController).enviarSnapshotHudPara(finalPlayerNum);
+                        } catch (Throwable t) {
+                            System.out.println("[SERVER] Ready->snapshot fallo: " + t.getMessage());
+                        }
+                    });
                 }
                 break;
             }
