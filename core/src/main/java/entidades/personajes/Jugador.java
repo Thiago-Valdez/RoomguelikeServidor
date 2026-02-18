@@ -209,7 +209,7 @@ public class Jugador extends Entidad {
 
     public void reaplicarEfectosDeItems() {
         // reset a base
-        this.vidaMaxima = 3;
+        this.vidaMaxima = 6;
         this.velocidadBase = 100f;
         // Importante: el gameplay usa Entidad.velocidad (via getVelocidad),
         // así que reseteamos ahí.
