@@ -19,4 +19,7 @@ public interface GameController {
 
     /** Request de sala despejada (puzzle resuelto) desde un cliente. */
     void roomClearRequest(int playerNum, String sala);
+
+    /** Fallback: request de pasar de nivel (el server valida). */
+    void nextLevelRequest(int playerNum);
 }

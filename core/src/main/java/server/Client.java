@@ -9,6 +9,10 @@ public class Client {
     private final int port;
     private final String id;
 
+    // Apariencia
+    private String genero = "MASCULINO";
+    private String estilo = "CLASICO";
+
     public Client(int num, InetAddress ip, int port) {
         this.num = num;
         this.ip = ip;
@@ -25,6 +29,11 @@ public class Client {
     public InetAddress getIp() { return ip; }
     public int getPort() { return port; }
     public String getId() { return id; }
+
+    public String getGenero() { return genero; }
+    public String getEstilo() { return estilo; }
+    public void setGenero(String genero) { if (genero != null && !genero.isBlank()) this.genero = genero; }
+    public void setEstilo(String estilo) { if (estilo != null && !estilo.isBlank()) this.estilo = estilo; }
 
     @Override
     public String toString() {
